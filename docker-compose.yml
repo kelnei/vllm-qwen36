@@ -1,0 +1,70 @@
+services:
+  vllm:
+    # unsloth NVFP4 needs vLLM >= 0.25.0 (bundles flashinfer 0.6.13 + cutlass-dsl 4.5.2 for the cute-DSL W4A4 path)
+    image: vllm/vllm-openai:v0.25.0
+    container_name: vllm-qwen36
+    restart: unless-stopped
+    ipc: host
+    ports:
+      - "8000:8000"
+    environment:
+      - HF_TOKEN=${HF_TOKEN?Set HF_TOKEN in .env or export it}
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - HF_HOME=/root/.cache/huggingface
+      - HUGGINGFACE_HUB_CACHE=/root/.cache/huggingface
+    volumes:
+      - huggingface_cache:/root/.cache/huggingface
+    command:
+      - "--model"
+      - "unsloth/Qwen3.6-27B-NVFP4"
+      - "--served-model-name"
+      - "qwen3.6-27b"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+      # no --quantization flag: auto-detects compressed-tensors; forcing a backend
+      # (e.g. marlin) drops decode throughput ~2.5x vs the auto-picked cute-DSL kernel
+      - "--kv-cache-dtype"
+      - "fp8"
+      - "--gpu-memory-utilization"
+      - "0.92"
+      - "--max-model-len"
+      - "262144"
+      - "--max-num-seqs"
+      - "64"
+      - "--max-num-batched-tokens"
+      - "32768"
+      - "--reasoning-parser"
+      - "qwen3"
+      - "--enable-auto-tool-choice"
+      - "--tool-call-parser"
+      - "qwen3_xml"
+      - "--speculative-config"
+      - '{"method": "mtp", "num_speculative_tokens": 2}'
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 600s
+
+volumes:
+  huggingface_cache:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${HOME}/.cache/huggingface

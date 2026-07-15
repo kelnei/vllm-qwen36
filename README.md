@@ -58,9 +58,21 @@ Measured on a single RTX PRO 6000 Blackwell (96 GB) with this compose file as-is
 
 The MoE's 3B active parameters make it ~2.5x faster per stream than the 27B dense model, and its smaller KV footprint nearly triples cache capacity at the same 262k context. Speculative-decode acceptance is prompt-dependent; expect a few points of variance either way.
 
+### DGX Spark (GB10)
+
+Same methodology on a DGX Spark (GB10, 121 GB unified memory) using [docker-compose.spark.yml](docker-compose.spark.yml) (`--gpu-memory-utilization 0.78`):
+
+| Model | Single-stream decode | 8 concurrent, aggregate | MTP acceptance | KV cache capacity |
+| --- | --- | --- | --- | --- |
+| [Qwen3.6-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-27B-NVFP4) | 24 tok/s | 148 tok/s | 73% | 1.8M tokens |
+| [Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-NVFP4) | 78 tok/s | 334 tok/s | 69% | 5.3M tokens |
+
+Roughly 4–5x slower than the RTX PRO 6000 — LPDDR5X bandwidth (~273 GB/s vs ~1.8 TB/s) is the limiter for decode — but KV cache capacity is slightly larger despite the lower utilization fraction, since the GB10 has more total memory. The MoE is the clear fit for this hardware: 78 tok/s single-stream is comfortably interactive.
+
 ## Tuning
 
 - `--gpu-memory-utilization 0.92` leaves headroom for CUDA graph capture; pushing it higher can OOM after the KV cache is allocated.
+- On unified-memory machines (DGX Spark / GB10) use [docker-compose.spark.yml](docker-compose.spark.yml) instead — select it with `COMPOSE_FILE=docker-compose.spark.yml` in `.env`. The GPU shares the 121 GB with the OS, so utilization is capped at 0.78: 0.85 measured to transiently starve the host below 5 GiB during KV-cache allocation, and 0.92 livelocks the machine hard enough to need a power cycle (disable swap so an overrun OOM-kills the engine instead of thrashing).
 - On GPUs with less memory, lower `--max-model-len` first — the full 262k context is the main memory consumer after the weights.
 - `--max-num-seqs 64` and `--max-num-batched-tokens 32768` are sized for a workstation serving a handful of concurrent clients; raise them for heavier batch serving.
 

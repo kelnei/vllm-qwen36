@@ -43,7 +43,20 @@ Model weights are cached in `${HOME}/.cache/huggingface` on the host (bind-mount
 
 ## Swapping models
 
-The compose file targets Qwen3.6-27B, but any Qwen3.6 NVFP4 checkpoint works the same way — for example an NVFP4 quant of the Qwen3.6-35B-A3B MoE model. Change `--model` (and `--served-model-name`) in `docker-compose.yml`, then `docker compose up -d`.
+The compose file targets Qwen3.6-27B, but any Qwen3.6 NVFP4 checkpoint works the same way. Change `--model` (and `--served-model-name`) in `docker-compose.yml`, then `docker compose up -d`.
+
+Verified with [unsloth/Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-NVFP4) (MoE, 3B active parameters): with only the two flags above changed, vLLM resolves the MoE architecture, loads the bundled MTP head, and picks the NVFP4 MoE fast path (`FLASHINFER_CUTLASS` backend). First boot reached healthy in ~7 minutes including the cold weight download, within the healthcheck's 10-minute allowance. See [Benchmarks](#benchmarks) for how it performs.
+
+## Benchmarks
+
+Measured on a single RTX PRO 6000 Blackwell (96 GB) with this compose file as-is (vLLM v0.25.0, MTP speculative decoding enabled): greedy chat completions generating 1024 tokens, decode rate timed from first to last token. Single-stream is the mean of 3 runs; the aggregate is one batch of 8 concurrent requests.
+
+| Model | Single-stream decode | 8 concurrent, aggregate | MTP acceptance | KV cache capacity |
+| --- | --- | --- | --- | --- |
+| [Qwen3.6-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-27B-NVFP4) | 113 tok/s | 761 tok/s | 73% | 1.7M tokens |
+| [Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-NVFP4) | 287 tok/s | 1,240 tok/s | 71% | 4.9M tokens |
+
+The MoE's 3B active parameters make it ~2.5x faster per stream than the 27B dense model, and its smaller KV footprint nearly triples cache capacity at the same 262k context. Speculative-decode acceptance is prompt-dependent; expect a few points of variance either way.
 
 ## Tuning
 

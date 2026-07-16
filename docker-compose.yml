@@ -1,7 +1,7 @@
 services:
   vllm:
     # unsloth NVFP4 needs vLLM >= 0.25.0 (bundles flashinfer 0.6.13 + cutlass-dsl 4.5.2 for the cute-DSL W4A4 path)
-    image: vllm/vllm-openai:v0.25.0
+    image: vllm/vllm-openai:v0.25.1
     container_name: vllm-qwen36
     restart: unless-stopped
     ipc: host

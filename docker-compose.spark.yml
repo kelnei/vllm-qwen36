@@ -22,8 +22,10 @@ services:
     environment:
       - HF_TOKEN=${HF_TOKEN?Set HF_TOKEN in .env or export it}
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      # HF_HOME alone is enough: the hub cache derives as $HF_HOME/hub. Setting
+      # HUGGINGFACE_HUB_CACHE to the HF_HOME root instead makes downloads land
+      # beside hub/ rather than inside it, silently bypassing the mounted cache.
       - HF_HOME=/root/.cache/huggingface
-      - HUGGINGFACE_HUB_CACHE=/root/.cache/huggingface
     volumes:
       - huggingface_cache:/root/.cache/huggingface
       # persist torch.compile + FlashInfer autotune caches across container

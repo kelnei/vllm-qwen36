@@ -58,6 +58,13 @@ Measured on a single RTX PRO 6000 Blackwell (96 GB) with this compose file as-is
 
 The MoE's 3B active parameters make it ~2.5x faster per stream than the 27B dense model, and its smaller KV footprint nearly triples cache capacity at the same 262k context. Speculative-decode acceptance is prompt-dependent; expect a few points of variance either way.
 
+Reproduce these figures against a running server with [bench.py](bench.py) (no dependencies beyond the standard library):
+
+```bash
+./bench.py                          # defaults to qwen3.6-27b
+./bench.py --model qwen3.6-35b-a3b
+```
+
 ### DGX Spark (GB10)
 
 Same methodology on a DGX Spark (GB10, 121 GB unified memory) using [docker-compose.spark.yml](docker-compose.spark.yml) (`--gpu-memory-utilization 0.78`), on vLLM v0.25.0\*:

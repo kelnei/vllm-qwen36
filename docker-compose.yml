@@ -29,8 +29,13 @@ services:
       # (e.g. marlin) drops decode throughput ~2.5x vs the auto-picked cute-DSL kernel
       - "--kv-cache-dtype"
       - "fp8"
+      # 0.85, not 0.92: gpu-memory-utilization only sizes the KV cache, it does
+      # not cap allocation, and vLLM's profiling pass under-measures the Qwen3.6
+      # GDN linear-attention scratch (chunk_gated_delta_rule). At 0.92 a 32-way
+      # batch filling --max-num-batched-tokens OOMs the engine outright; 0.85
+      # costs ~11% KV capacity and no measurable throughput.
       - "--gpu-memory-utilization"
-      - "0.92"
+      - "0.85"
       - "--max-model-len"
       - "262144"
       - "--max-num-seqs"

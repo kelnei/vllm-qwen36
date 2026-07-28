@@ -29,6 +29,18 @@ services:
       # (e.g. marlin) drops decode throughput ~2.5x vs the auto-picked cute-DSL kernel
       - "--kv-cache-dtype"
       - "fp8"
+      # Pinned, not defaulted. vLLM turns prefix caching off by default for
+      # hybrid models (Qwen3.6 is 48 linear-attention + 16 full-attention
+      # layers) and keeps it opt-in "while the feature matures" — so the
+      # default is likely to flip on a future bump and would silently change
+      # both behaviour and every published benchmark number. Off is what the
+      # Benchmarks section measured.
+      #
+      # Consequence: multi-turn chat re-prefills the whole conversation each
+      # turn. Turning it on only helps prefixes >= the 1600-token block size
+      # this model forces (attention page size must be >= mamba page size), so
+      # short system prompts gain nothing. See README "Tuning".
+      - "--no-enable-prefix-caching"
       # 0.85, not 0.92: gpu-memory-utilization only sizes the KV cache, it does
       # not cap allocation, and vLLM's profiling pass under-measures the Qwen3.6
       # GDN linear-attention scratch (chunk_gated_delta_rule). At 0.92 a 32-way

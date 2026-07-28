@@ -52,6 +52,11 @@ services:
       # (e.g. marlin) drops decode throughput ~2.5x vs the auto-picked cute-DSL kernel
       - "--kv-cache-dtype"
       - "fp8"
+      # Pinned, not defaulted — see the note in docker-compose.yml. vLLM
+      # disables prefix caching by default for hybrid models like Qwen3.6 and
+      # keeps it opt-in while the feature matures, so an unpinned default could
+      # flip on a version bump and silently invalidate the published numbers.
+      - "--no-enable-prefix-caching"
       # fraction of *unified* memory; the remainder is all the OS gets (see header).
       # 0.85 measured unsafe: the KV-cache grab transiently drove host MemAvailable
       # below 5 GiB (livelock territory). 0.78 keeps the worst case >= ~13 GiB.

@@ -36,6 +36,7 @@ Model weights are cached in `${HOME}/.cache/huggingface` on the host (bind-mount
 | --- | --- | --- |
 | Context length | 262,144 tokens | The model's full native context |
 | KV cache | fp8 | Roughly doubles KV capacity vs fp16 |
+| Prefix caching | off (pinned) | vLLM disables it by default for hybrid models — Qwen3.6 is 48 linear-attention + 16 full-attention layers — and keeps it opt-in while the feature matures. Pinned explicitly with `--no-enable-prefix-caching` so a future default flip can't silently change behaviour. **Multi-turn chat therefore re-prefills the whole conversation each turn**; see [Tuning](#tuning) before enabling it |
 | Speculative decoding | MTP, 2 draft tokens | Uses the model's bundled multi-token-prediction head |
 | Reasoning parser | `qwen3` | Exposes thinking via the API's `reasoning` field |
 | Tool-call parser | `qwen3_xml` | Matches the XML-style tool calls this model emits (`hermes` silently fails to parse them) |
@@ -156,6 +157,20 @@ Both machines ran the identical matrix, each against its own compose file as shi
   On the Spark the smaller chunk also makes prefill itself faster, which is the bigger effect: an 8k prompt prefills in 3.64 s at 2048 versus 6.23 s at 32768, a 1.7x speedup. A 1k prompt — which fits in one chunk under either setting — is unchanged at 0.53 s, confirming the difference comes from chunk size rather than from anything else in the config. Sweeping 32768/8192/4096/2048/1024 put the knee at 2048; 1024 gains a further 7% at c64 but gives up 16% at c32.
 
   Two caveats. This was tuned on the **27B dense** model, which is what the compose file ships; the 35B-A3B MoE prefills ~2.7x faster and sees roughly no benefit — at 8k it measured −14/−5/+4% at c8/c32/c64 — so revisit the value if you swap models. And on the RTX PRO 6000 the sweep found **no dominant value** — 32768 is 23% faster at c8 while 8192 is 11% faster at c64 — so it keeps the larger chunk.
+
+- **`--no-enable-prefix-caching` is pinned, and it is worth turning on only for long shared prefixes.** vLLM disables prefix caching by default for hybrid models and keeps it opt-in while the feature matures, so the flag is pinned rather than left to a default that may flip. To enable it, swap the flag for `--enable-prefix-caching`.
+
+  The catch is block size. This model forces a **1600-token** KV block (the attention page size must be at least the mamba page size), and vLLM never reuses the last matched block, so the cacheable part of a shared prefix is `(floor(prefix ÷ 1600) − 1)` blocks. **A shared prefix below 3,200 tokens therefore hits nothing at all** — a typical few-hundred-token system prompt gains exactly zero. Measured on the RTX PRO 6000 at 8k total input, 16 prompts, c8, varying only how much of the input is a prefix shared by every request:
+
+  | shared prefix | hit rate | median TTFT off → on | throughput off → on |
+  | --- | --- | --- | --- |
+  | 0 / 512 / 1,600 | 0% | no gain | no gain |
+  | 3,200 | 17% | 2.59 s → 2.41 s | 235 → 264 tok/s (+12%) |
+  | 6,400 | 52% | 2.60 s → 1.72 s (−34%) | 235 → 359 tok/s (+53%) |
+
+  So it is a clear win for RAG or long-document workloads that resend a large fixed context, and no help for chat with a short system prompt. At the no-hit prefix lengths the caching-on runs also measured somewhat worse TTFT, but throughput was flat there and these are single runs, so treat that as "no benefit" rather than a quantified cost.
+
+  Enabling it did **not** change what the model emits: greedy completions from a 8,597-token prompt were byte-identical cold versus 74% served from cache, with two cold runs matching each other first to confirm the comparison had any power. That is one prompt, not a correctness proof.
 
 - `--max-num-seqs 64` is sized for a workstation serving a handful of concurrent clients; raise it for heavier batch serving. Note that memory headroom, not this setting, is what actually bounds usable concurrency — see the utilization note above.
 

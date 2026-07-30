@@ -9,6 +9,10 @@ if [ -z "${HF_TOKEN:-}" ] && [ ! -f .env ]; then
   exit 1
 fi
 
+# The huggingface_cache volume bind-mounts $HOME/.cache/huggingface; Docker's
+# local driver does not create it, so make sure it exists before compose mounts it.
+mkdir -p "$HOME/.cache/huggingface"
+
 docker compose pull
 docker compose up -d
 echo "vLLM starting — watch logs with: docker compose logs -f"

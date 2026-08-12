@@ -29,17 +29,15 @@
 #   CLUSTER_HEAD_IP   head node's IP on the 200G link (worker + serve need it)
 #   CLUSTER_IF        200G interface name        (default enP2p1s0f1np1)
 #   CLUSTER_HCA       its RDMA device for RoCE   (default roceP2p1s0f1)
-#   VLLM_IMAGE        container image            (default: pinned nightly, see below)
+#   VLLM_IMAGE        container image            (default: same tag as compose)
 #
-# Unlike the compose files (v0.26.0), the cluster pins a *nightly* image.
-# v0.26.0 cannot serve multi-node reliably: its shm_broadcast message queue —
-# which the executor uses to drive cross-node workers — can lose a reader
+# Multi-node needs v0.27.0 or later. v0.26.0's shm_broadcast message queue —
+# which the executor uses to drive cross-node workers — could lose a reader
 # wakeup notification, leaving the engine and both workers parked forever on
-# queues that have data (nondeterministic; py-spy shows the idle deadlock
-# triangle; the engine then dies with "RPC call to sample_tokens timed out").
-# Upstream main bounds the park time with SHM_READER_RECHECK_INTERVAL_MS so a
-# lost notify recovers within ~5 s; this nightly is pinned by commit SHA as
-# the first known-good image. Re-pin to the next tagged release when it lands.
+# queues that have data (nondeterministic; the engine then dies with "RPC
+# call to sample_tokens timed out"). The fix (SHM_READER_RECHECK_INTERVAL_MS
+# bounds the park time so a lost notify recovers within ~5 s) shipped in
+# v0.27.0; this script briefly pinned a nightly by SHA while waiting for it.
 #
 # The image ships without Ray, so each node pip-installs ray[default] at
 # container start (~1 min, needs internet) — same bootstrap as vLLM's own
@@ -60,7 +58,7 @@ fi
 
 CLUSTER_IF="${CLUSTER_IF:-enP2p1s0f1np1}"
 CLUSTER_HCA="${CLUSTER_HCA:-roceP2p1s0f1}"
-VLLM_IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:nightly-d223c900d85224c02f2162ee2c757a769e99f519}"
+VLLM_IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:v0.27.1}"
 RAY_PORT=6379
 CONTAINER=ray-node
 NODE_SESSION=ray-node
@@ -68,7 +66,7 @@ SERVE_SESSION=vllm-serve
 SERVE_LOG="$HOME/vllm-cluster-serve.log"
 
 usage() {
-  sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//'
+  sed -n '2,44p' "$SELF" | sed 's/^# \{0,1\}//'
   exit 1
 }
 

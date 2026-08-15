@@ -1,0 +1,172 @@
+# RTX 5090 (32 GB) variant of docker-compose.yml, serving the Qwen3.8-27B
+# NVFP4 checkpoint. Tested on a headless machine with the card dedicated to
+# this model.
+#
+# "Dedicated" is not a detail — it is the precondition for everything below.
+# The KV cache here is sized to within ~1.9 GiB of the card's total capacity,
+# measured under load. A desktop session, a browser, or any other CUDA process
+# sharing the GPU will take that headroom and the engine will die on the first
+# concurrent burst rather than degrade. If the card is shared, none of these
+# numbers apply and the pool must be re-derived with the rest of the load
+# subtracted from the budget.
+#
+# Unlike the GB10, memory here is discrete, fixed, and the entire problem. The
+# budget on a headless card is ~32,607 MiB, and the model spends it like this:
+#
+#   weights + non-torch      22.37 - 22.55 GiB
+#   CUDA graphs               0.14 GiB
+#   peak activation           2.0  GiB   (at --max-num-batched-tokens <= 8192)
+#   KV cache                  5.75 GiB   <- everything left over
+#
+# So the KV pool is a residual, not a target, and the two dials that actually
+# move it are --max-num-batched-tokens and --kv-cache-memory. Both are set
+# explicitly below rather than left to --gpu-memory-utilization, because the
+# fraction-based path cannot see the peak that matters (see the notes on each).
+#
+# Tuned for c1-c8, not for wide concurrency.
+#
+# Select this file via .env so ./start.sh works unchanged:
+#   COMPOSE_FILE=docker-compose.rtx5090.yml
+services:
+  vllm:
+    image: vllm/vllm-openai:v0.27.1
+    container_name: vllm-qwen38
+    restart: unless-stopped
+    ipc: host
+    ports:
+      - "8000:8000"
+    environment:
+      - HF_TOKEN=${HF_TOKEN?Set HF_TOKEN in .env or export it}
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      # HF_HOME alone is enough: the hub cache derives as $HF_HOME/hub. Setting
+      # HUGGINGFACE_HUB_CACHE to the HF_HOME root instead makes downloads land
+      # beside hub/ rather than inside it, silently bypassing the mounted cache.
+      - HF_HOME=/root/.cache/huggingface
+    volumes:
+      - huggingface_cache:/root/.cache/huggingface
+      # persist torch.compile + FlashInfer autotune caches across container
+      # recreation: warm start ~2 min instead of ~9
+      - vllm_cache:/root/.cache/vllm
+    command:
+      # positional, not --model: v0.26.0 deprecates the flag and will remove it
+      - "kelnei/Qwen3.8-27B-NVFP4"
+      - "--served-model-name"
+      - "qwen3.8-27b"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+      # `auto` already resolves to fp8 here (the checkpoint ships a
+      # kv_cache_scheme), but pin it so the resolution is visible.
+      #
+      # Not nvfp4: no attention backend in 0.27.1 accepts it at this model's
+      # head_size of 256 — FLASH_ATTN, FLASHINFER, TRITON_ATTN, FLEX_ATTENTION
+      # and TURBOQUANT all reject it and the engine refuses to start. The
+      # turboquant 4-bit variants do run and do buy capacity (fp8 47,981 tokens
+      # per 2 GiB, turboquant_k8v4 61,067, turboquant_4bit_nc 74,638), but they
+      # cost decode throughput and the quality difference is unmeasurable: with
+      # the attention backend held constant, fp8, k8v4 and 4bit_nc each differ
+      # from bf16 by the same ~5.7% of teacher-forced top-1 positions and the
+      # same ~0.015 mean top-5 KL. That ~5.7% is the near-tie population, not a
+      # quality ladder — it saturates at the first perturbation and does not
+      # grow from 8-bit to 4-bit.
+      #
+      # Beware when A/B-ing this flag: the KV dtype silently selects the
+      # attention backend (bf16 -> FLASH_ATTN, fp8 -> FLASHINFER), so a naive
+      # comparison changes kernels too. Only TRITON_ATTN runs both correctly;
+      # forcing FLASHINFER with bf16 KV produces incoherent output on this
+      # model. Pin it with --attention-backend (the VLLM_ATTENTION_BACKEND env
+      # var was removed in 0.27.1 and is now silently ignored).
+      - "--kv-cache-dtype"
+      - "fp8"
+      # On, unlike the other compose files in this repo, which pin it off. It is
+      # worth having for long shared prefixes, but note the hybrid allocator
+      # forces a 1600-token KV block and vLLM never reuses the last matched
+      # block, so a shared prefix below 3,200 tokens caches nothing at all — a
+      # short system prompt gains exactly zero. Pinned explicitly either way, so
+      # a future change to vLLM's hybrid-model default cannot silently flip it.
+      - "--enable-prefix-caching"
+      # Deliberately non-binding. --kv-cache-memory below is the real limit, and
+      # this is set high so the fraction never becomes the binding constraint
+      # and quietly changes the pool out from under the tuned value.
+      #
+      # Do not size the KV pool from the fraction, and do not trust the startup
+      # line that suggests a --kv-cache-memory "to fully utilize gpu memory":
+      # both derive from the peak observed during *profiling*, which
+      # under-measures the real peak under load by 1-2 GiB. Sized from the
+      # startup suggestion (6.03 GiB) the engine boots fine, then dies on the
+      # first concurrent burst — measured: torch.OutOfMemoryError trying to
+      # allocate 272 MiB with 269 MiB free, EngineDeadError, 8 of 16 requests
+      # 500'd, peak 31,702 MiB. The 5.75 GiB below comes from a load test
+      # instead, and peaks at 30,706 of 32,607 MiB with no failures.
+      - "--gpu-memory-utilization"
+      - "0.98"
+      # 5.75 GiB -> 153,382 KV tokens at the --max-model-len below. Re-derive
+      # this after any change to the model, the image, --max-model-len or
+      # --max-num-batched-tokens; it is not portable.
+      - "--kv-cache-memory"
+      - "6174015488"
+      # Counterintuitively, a *larger* --max-model-len yields more usable tokens
+      # from the same KV bytes, because it changes how the hybrid allocator pads
+      # attention and mamba pages to a common size: 32768 -> 120,149 tokens,
+      # 65536 -> 144,179, 131072 -> 153,382. Isolated to this flag —
+      # --max-num-seqs 8 and 16 give the same count.
+      - "--max-model-len"
+      - "131072"
+      # 8 concurrent sequences, matching the c1-c8 target. Raising this does not
+      # cost KV memory (the pool is fixed above), it only divides it: at 8 seqs
+      # every request can hold ~19k tokens of context before the pool is the
+      # limit rather than --max-model-len. Note the corollary at the top end —
+      # one request at the full 131k context consumes most of the pool (max
+      # concurrency 1.17x), so long-context and concurrent use are exclusive.
+      - "--max-num-seqs"
+      - "8"
+      # 2048 for the opposite reason to the GB10 file: not prefill latency, but
+      # pure memory. The gated-DeltaNet chunked scratch buffer scales with this
+      # value at ~0.22 GiB per 1k tokens as profiled and ~0.38 GiB per 1k under
+      # load, and every byte of it comes straight out of the KV pool. 32768 does
+      # not boot at all ("Available KV cache memory: -2.96 GiB" -> ValueError:
+      # No available memory for the cache blocks).
+      #
+      # Nothing is given up for it: prefill on this card is compute-bound at
+      # ~9.5k tok/s and linear in prompt length, so chunk size is neutral across
+      # 2048-8192, and 16384 is 16-26% *worse* at 16k-30k prompts. Going 2048 ->
+      # 8192 would buy no prefill speed and cost ~47k KV tokens.
+      - "--max-num-batched-tokens"
+      - "2048"
+      - "--reasoning-parser"
+      - "qwen3"
+      - "--enable-auto-tool-choice"
+      - "--tool-call-parser"
+      - "qwen3_xml"
+      # k=2 measured 54.9% acceptance on greedy decode here.
+      - "--speculative-config"
+      - '{"method": "mtp", "num_speculative_tokens": 2}'
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      # cold start (empty vllm_cache) compiles everything: allow 15 min
+      start_period: 900s
+
+volumes:
+  huggingface_cache:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${HOME}/.cache/huggingface
+  vllm_cache:

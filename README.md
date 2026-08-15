@@ -64,6 +64,41 @@ The serve profile reuses the single-Spark tuning unchanged — fp8 KV cache, uti
 
 One caveat if you pin your own image: multi-node needs **vLLM v0.27.0 or later**. v0.26.0's shared-memory message queue — which the engine uses to drive cross-node workers — can lose a reader wakeup notification, parking the engine and both workers forever on queues that have data; the engine then dies minutes later with "RPC call to sample_tokens timed out". v0.27.0 bounds the park time so a lost wakeup recovers within ~5 s. Single-node deployments don't exercise this path at risk.
 
+## 32 GB cards (RTX 5090)
+
+[docker-compose.rtx5090.yml](docker-compose.rtx5090.yml) serves [kelnei/Qwen3.8-27B-NVFP4](https://huggingface.co/kelnei/Qwen3.8-27B-NVFP4) on a single RTX 5090. Select it with `COMPOSE_FILE=docker-compose.rtx5090.yml` in `.env`. It targets 1–8 concurrent requests, not wide serving, and it is a **different model** from the rest of this repo — the Qwen3.8 checkpoint, whose numbers are not comparable to the Qwen3.6 tables below.
+
+**This config assumes a headless machine with the card dedicated to the model.** That is a precondition, not a detail. The KV pool below is sized to within ~1.9 GiB of the card's total capacity, measured under load; a desktop session, a browser, or any other CUDA process sharing the GPU takes that headroom and the engine dies on the first concurrent burst rather than degrading gracefully. On a shared card none of these numbers hold and the pool has to be re-derived with the rest of the load subtracted from the budget.
+
+At 32 GB the KV cache is whatever survives the weights, and there is not much slack:
+
+| | |
+| --- | --- |
+| Total (headless, dedicated) | 32,607 MiB |
+| Weights + non-torch | 22.37–22.55 GiB |
+| CUDA graphs | 0.14 GiB |
+| Peak activation | 2.0 GiB |
+| **KV cache** | **5.75 GiB → 153,382 tokens** |
+
+Two departures from the other configs make that fit, both about the same underlying problem — the profiling pass under-measures the gated-DeltaNet path, so the fraction-based sizing is unsafe here in a way it is not on a 96 GB card:
+
+- **`--kv-cache-memory` is set explicitly and `--gpu-memory-utilization` is parked at 0.98**, deliberately non-binding. Sizing the pool from the fraction, or from the startup line that suggests a `--kv-cache-memory` value "to fully utilize gpu memory", produces a server that boots clean and then dies on the first concurrent burst: at the suggested 6.03 GiB it hit `torch.OutOfMemoryError` on a 272 MiB allocation with 269 MiB free, took `EngineDeadError`, and 500'd 8 of 16 requests at a 31,702 MiB peak. The 5.75 GiB above was sized from a load test instead and peaks at 30,706 MiB with no failures.
+- **`--max-num-batched-tokens 2048`, for memory rather than latency.** The GDN chunked scratch buffer scales at ~0.22 GiB per 1k tokens as profiled and ~0.38 GiB per 1k under load, straight out of the KV pool; 32768 does not boot at all (`Available KV cache memory: -2.96 GiB`). Nothing is lost by going small — prefill on this card is compute-bound at ~9.5k tok/s and chunk size is neutral from 2048 to 8192, while 16384 is 16–26% *worse* at 16k–30k prompts. Raising 2048 → 8192 would buy no prefill speed and cost ~47k KV tokens.
+
+One counterintuitive result: a *larger* `--max-model-len` yields **more** usable KV tokens from identical bytes, because it changes how the hybrid allocator pads attention and mamba pages to a common size — 32768 gives 120,149 tokens, 65536 gives 144,179, and the 131072 shipped here gives 153,382. It is isolated to that flag; `--max-num-seqs` 8 and 16 give the same count. The trade-off is at the top end: one request at the full 131k context consumes most of the pool (max concurrency 1.17x), so long-context and concurrent use are mutually exclusive here.
+
+Prefix caching is **on** in this file, unlike the others in this repo. Note the hybrid allocator forces a 1600-token KV block and vLLM never reuses the last matched block, so a shared prefix below 3,200 tokens caches nothing at all — see [Tuning](#tuning) for the measured hit rates.
+
+Measured on this config, greedy, MTP k=2 at 54.9% acceptance:
+
+| | c1 | c8 |
+| --- | --- | --- |
+| Chat decode | 99.5 tok/s | 721 tok/s |
+| 8k prompts, output throughput | — | 365.6 tok/s |
+| TTFT, 1k / 8k prompt | 135 ms / 903 ms | median 2.91 s at 8k |
+
+Image input works on this config as shipped (the checkpoint is a VL model), verified end-to-end against the served endpoint.
+
 ## Benchmarks
 
 All figures below were measured on vLLM v0.26.0 (the cluster on a v0.27 pre-release nightly) with this repo's config as-is, MTP speculative decoding enabled, on three Blackwell setups; the repo now pins v0.27.1:
@@ -181,7 +216,12 @@ All three configurations ran the identical matrix, each against its config as sh
 
 - `--gpu-memory-utilization 0.85` is a concurrency ceiling, not just a KV-cache dial. The flag only decides how much memory is *left over* for the KV cache after a profiling pass estimates peak activation — it does not cap allocation. That profile under-measures the Qwen3.6 GDN linear-attention path (`chunk_gated_delta_rule`), whose scratch buffers scale with total batched tokens. At 0.92 on a 96 GB card the engine dies outright once a 32-way batch fills `--max-num-batched-tokens`: `torch.OutOfMemoryError` on a 372 MiB allocation with 285 MiB free, taking the container down with it. 0.85 costs ~11% of KV capacity (1.71M → 1.51M tokens, still 5.8x the full context) and no measurable throughput. Raise it only if you also lower `--max-num-seqs`.
 - On unified-memory machines (DGX Spark / GB10) use [docker-compose.spark.yml](docker-compose.spark.yml) instead — select it with `COMPOSE_FILE=docker-compose.spark.yml` in `.env`. The GPU shares the 121 GB with the OS, so utilization is capped at 0.78: 0.85 measured to transiently starve the host below 5 GiB during KV-cache allocation, and 0.92 livelocks the machine hard enough to need a power cycle (disable swap so an overrun OOM-kills the engine instead of thrashing).
-- On GPUs with less memory, lower `--max-model-len` first — the full 262k context is the main memory consumer after the weights.
+- On GPUs with less memory, lower `--max-model-len` first — the full 262k context is the main memory consumer after the weights. On a 32 GB card that is not enough on its own; see [32 GB cards](#32-gb-cards-rtx-5090) for a config where the KV pool is set in bytes and `--max-num-batched-tokens` is a memory dial rather than a latency one.
+- **A smaller KV dtype than fp8 is not available on these models, and would not buy much quality-adjusted capacity if it were.** `--kv-cache-dtype nvfp4` is rejected by every attention backend in v0.27.1 at this architecture's `head_size=256` (FLASH_ATTN, FLASHINFER, TRITON_ATTN, FLEX_ATTENTION, TURBOQUANT), so the engine refuses to start. The `turboquant_*` 4-bit variants do run, and do add capacity — measured per 2 GiB of pool on the 27B: bf16 27,989 tokens, fp8 47,981 (1.71x), `turboquant_k8v4` 61,067 (2.18x), `turboquant_4bit_nc` 74,638 (2.67x) — but they cost decode throughput. Note the ratios fall short of the nominal ones (fp8 gives 1.71x, not 2x) because 48 of the 64 layers are gated-DeltaNet recurrent state held in fp32; it shares the same pool and does not quantize, so the dial only moves the 16 full-attention layers.
+
+  On fidelity the three quantized dtypes are indistinguishable. With the attention backend held constant, each differs from bf16 on the same ~5.7% of teacher-forced top-1 positions, with the same ~0.015 mean top-5 KL and ~0.0017 median — and fp8 versus `turboquant_4bit_nc` differs by that same ~5.7%. That number is the size of the near-tie population, not a quality ladder: it saturates at the first perturbation and does not grow from 8 bits to 4. Resolving a real difference would need an end-to-end eval, not logprob agreement.
+
+  **If you A/B this flag yourself, pin the backend.** The KV dtype silently selects it — bf16 picks FLASH_ATTN, fp8 picks FLASHINFER — so the naive comparison swaps kernels at the same time. Only TRITON_ATTN runs both dtypes correctly here; forcing FLASHINFER with a bf16 KV cache produces incoherent output on this model (it lost a 14k-token document entirely and hallucinated about it), while agreeing with bf16-on-FLASH_ATTN only 48% of the time. Pin it with `--attention-backend`: the `VLLM_ATTENTION_BACKEND` environment variable was removed in v0.27.1 and is now **silently ignored**.
 - **`--max-num-batched-tokens` should be sized to how fast your GPU prefills, not to how much memory it has.** A chunked-prefill step blocks every decoding request until it finishes, so the worst-case decode stall is `max-num-batched-tokens ÷ prefill rate` — visible directly as p99 inter-token latency. The RTX PRO 6000 prefills the 27B at ~11k tok/s, so its 32768-token chunk costs a ~3 s stall; the GB10 prefilled at ~1.3k tok/s under that setting, so the *same value* cost it ~25 s (measured p99 ITL 28.2 s at 8k/c64). Hence 2048 on the Spark and 32768 on the RTX.
 
   On the Spark the smaller chunk also makes prefill itself faster, which is the bigger effect: an 8k prompt prefills in 3.64 s at 2048 versus 6.23 s at 32768, a 1.7x speedup. A 1k prompt — which fits in one chunk under either setting — is unchanged at 0.53 s, confirming the difference comes from chunk size rather than from anything else in the config. Sweeping 32768/8192/4096/2048/1024 put the knee at 2048; 1024 gains a further 7% at c64 but gives up 16% at c32.

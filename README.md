@@ -103,7 +103,7 @@ Image input works on this config as shipped (the checkpoint is a VL model), veri
 
 ## Benchmarks
 
-All figures below were measured on vLLM v0.26.0 (the cluster on a v0.27 pre-release nightly) with this repo's config as-is, MTP speculative decoding enabled, on three Blackwell setups; the repo now pins v0.29.0 (the RTX 5090 row above is the only one re-verified on it so far):
+All figures below were measured on vLLM v0.26.0 (the cluster on a v0.27 pre-release nightly) with this repo's config as-is, MTP speculative decoding enabled, on three Blackwell setups; the repo now pins v0.29.0, and the 27B was re-verified on it on every config — see the second table:
 
 | Machine | GPU | Memory | Config | `--gpu-memory-utilization` | `--max-num-batched-tokens` |
 | --- | --- | --- | --- | --- | --- |
@@ -125,6 +125,16 @@ Greedy chat completions generating 1024 tokens, decode rate timed from the first
 | DGX Spark | [Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-NVFP4) | 76 tok/s | 316 tok/s | 67% | 5.70M tokens |
 | 2x DGX Spark | [Qwen3.6-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-27B-NVFP4) | 28 tok/s | 169 tok/s | 70% | 4.48M tokens |
 | 2x DGX Spark | [Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-NVFP4) | 64 tok/s | 311 tok/s | 68% | 13.26M tokens |
+
+Re-verified on **v0.29.0** (2026-09-09), Qwen3.6-27B only, each against a v0.27.1 control run the same day on the same machine (the cluster against its 2026-08-12/19 v0.27.1 figures of 28 / 167–178). v0.29.0 makes the V2 model runner the default, which captures FULL decode CUDA graphs where v0.27.1 fell back to PIECEWISE with MTP on FlashInfer; the discrete cards and the cluster gain from it, the single Spark does not. Graph capture costs more memory everywhere (3.2 GiB vs 1.1 on a Spark), which is where the smaller KV pools come from:
+
+| Machine | v0.27.1 control, c1 / c8 | v0.29.0, c1 / c8 | MTP acceptance | KV cache capacity |
+| --- | --- | --- | --- | --- |
+| RTX PRO 6000 | 116 / 824 tok/s | **123 / 940 tok/s** | 69% | 1.48M tokens |
+| DGX Spark | 23 / 145 tok/s | 23 / 151 tok/s | 70% | 1.91M tokens |
+| 2x DGX Spark | 28 / 167 tok/s | **37 / 228 tok/s** | 69% | 4.37M tokens |
+
+The Spark's host memory bottomed out at 19 GiB available during the single-node boot and 12 GiB on the cluster head, both more comfortable than v0.27.1 at the same 0.78 utilization. Tool calling and the reasoning parser were checked on every config.
 
 Reproduce against a running server with [bench.py](bench.py) (no dependencies beyond the standard library):
 

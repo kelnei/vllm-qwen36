@@ -59,7 +59,7 @@ fi
 
 CLUSTER_IF="${CLUSTER_IF:-enP2p1s0f1np1}"
 CLUSTER_HCA="${CLUSTER_HCA:-roceP2p1s0f1}"
-VLLM_IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:v0.27.1}"
+VLLM_IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:v0.29.0}"
 RAY_PORT=6379
 CONTAINER=ray-node
 NODE_SESSION=ray-node

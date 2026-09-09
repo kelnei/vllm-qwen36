@@ -97,11 +97,13 @@ Measured on this config, greedy, MTP k=2 at 54.9% acceptance:
 | 8k prompts, output throughput | — | 365.6 tok/s |
 | TTFT, 1k / 8k prompt | 135 ms / 903 ms | median 2.91 s at 8k |
 
+Those were measured on v0.27.1. Re-run on v0.29.0 (2026-09-09, same bench, same-day v0.27.1 control of 100.1 / 664 tok/s), chat decode moved to **112.2 tok/s at c1 and 893 tok/s at c8**, acceptance 60.1%: the new default V2 model runner captures FULL decode CUDA graphs where v0.27.1 fell back to PIECEWISE with MTP on FlashInfer. The KV pool is unchanged at 153,382 tokens, but graph capture takes 0.33 GiB instead of 0.14 and idle usage is ~1.4 GiB higher, so the headroom under a 16-request burst of unique 13k-token prompts is now ~1.3 GiB (peak 31,274 MiB, no failures). The 8k-prompt and TTFT rows were not re-measured.
+
 Image input works on this config as shipped (the checkpoint is a VL model), verified end-to-end against the served endpoint.
 
 ## Benchmarks
 
-All figures below were measured on vLLM v0.26.0 (the cluster on a v0.27 pre-release nightly) with this repo's config as-is, MTP speculative decoding enabled, on three Blackwell setups; the repo now pins v0.27.1:
+All figures below were measured on vLLM v0.26.0 (the cluster on a v0.27 pre-release nightly) with this repo's config as-is, MTP speculative decoding enabled, on three Blackwell setups; the repo now pins v0.29.0 (the RTX 5090 row above is the only one re-verified on it so far):
 
 | Machine | GPU | Memory | Config | `--gpu-memory-utilization` | `--max-num-batched-tokens` |
 | --- | --- | --- | --- | --- | --- |

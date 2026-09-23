@@ -62,13 +62,21 @@ Verified with [unsloth/Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/unsloth/Qwe
 
 The serve profile reuses the single-Spark tuning unchanged — fp8 KV cache, utilization 0.78 (a per-node fraction; the host-starvation ceiling it protects doesn't move by adding a machine), `--max-num-batched-tokens 2048` — and keeps MTP speculative decoding on.
 
+If the engine dies at startup with `RuntimeError: NCCL error: unhandled system error` out of the first pynccl all-reduce, the cause is on the hosts, not in vLLM. Rerunning with `NCCL_DEBUG=INFO` shows the RoCE NIC failing to register NCCL's buffers (`ibv_reg_mr_iova2 failed with error Cannot allocate memory`), even with gigabytes free and memlock unlimited. The trigger is the state of host memory after some uptime on the DGX OS 7.0 kernel, and it fails the same way on any vLLM version. It comes and goes: the same boot can fail twice and then succeed. Dropping the page cache and compacting memory on **both** Sparks clears it:
+
+```bash
+sync; echo 3 | sudo tee /proc/sys/vm/drop_caches; echo 1 | sudo tee /proc/sys/vm/compact_memory
+```
+
+Then `stop` both nodes and bring up `head`, `worker` and `serve` again. Setting `NCCL_DMABUF_ENABLE=0` or `NCCL_CUMEM_HOST_ENABLE=0` does not help.
+
 One caveat if you pin your own image: multi-node needs **vLLM v0.27.0 or later**. v0.26.0's shared-memory message queue — which the engine uses to drive cross-node workers — can lose a reader wakeup notification, parking the engine and both workers forever on queues that have data; the engine then dies minutes later with "RPC call to sample_tokens timed out". v0.27.0 bounds the park time so a lost wakeup recovers within ~5 s. Single-node deployments don't exercise this path at risk.
 
 ## 32 GB cards (RTX 5090)
 
 [docker-compose.rtx5090.yml](docker-compose.rtx5090.yml) serves [kelnei/Qwen3.8-27B-NVFP4](https://huggingface.co/kelnei/Qwen3.8-27B-NVFP4) on a single RTX 5090. Select it with `COMPOSE_FILE=docker-compose.rtx5090.yml` in `.env`. It targets 1–8 concurrent requests, not wide serving, and it is a **different model** from the rest of this repo — the Qwen3.8 checkpoint, whose numbers are not comparable to the Qwen3.6 tables below.
 
-**This config assumes a headless machine with the card dedicated to the model.** That is a precondition, not a detail. The KV pool below is sized to within ~1.9 GiB of the card's total capacity, measured under load; a desktop session, a browser, or any other CUDA process sharing the GPU takes that headroom and the engine dies on the first concurrent burst rather than degrading gracefully. On a shared card none of these numbers hold and the pool has to be re-derived with the rest of the load subtracted from the budget.
+**This config assumes a headless machine with the card dedicated to the model.** That is a precondition, not a detail. The KV pool below is sized to within ~1.3 GiB of the card's total capacity, measured under load; a desktop session, a browser, or any other CUDA process sharing the GPU takes that headroom and the engine dies on the first concurrent burst rather than degrading gracefully. On a shared card none of these numbers hold and the pool has to be re-derived with the rest of the load subtracted from the budget.
 
 At 32 GB the KV cache is whatever survives the weights, and there is not much slack:
 
@@ -76,13 +84,13 @@ At 32 GB the KV cache is whatever survives the weights, and there is not much sl
 | --- | --- |
 | Total (headless, dedicated) | 32,607 MiB |
 | Weights + non-torch | 22.37–22.55 GiB |
-| CUDA graphs | 0.14 GiB |
+| CUDA graphs | 0.33 GiB |
 | Peak activation | 2.0 GiB |
 | **KV cache** | **5.75 GiB → 153,382 tokens** |
 
 Two departures from the other configs make that fit, both about the same underlying problem — the profiling pass under-measures the gated-DeltaNet path, so the fraction-based sizing is unsafe here in a way it is not on a 96 GB card:
 
-- **`--kv-cache-memory` is set explicitly and `--gpu-memory-utilization` is parked at 0.98**, deliberately non-binding. Sizing the pool from the fraction, or from the startup line that suggests a `--kv-cache-memory` value "to fully utilize gpu memory", produces a server that boots clean and then dies on the first concurrent burst: at the suggested 6.03 GiB it hit `torch.OutOfMemoryError` on a 272 MiB allocation with 269 MiB free, took `EngineDeadError`, and 500'd 8 of 16 requests at a 31,702 MiB peak. The 5.75 GiB above was sized from a load test instead and peaks at 30,706 MiB with no failures.
+- **`--kv-cache-memory` is set explicitly and `--gpu-memory-utilization` is parked at 0.98**, deliberately non-binding. Sizing the pool from the fraction, or from the startup line that suggests a `--kv-cache-memory` value "to fully utilize gpu memory", produces a server that boots clean and then dies on the first concurrent burst: at the suggested 6.03 GiB it hit `torch.OutOfMemoryError` on a 272 MiB allocation with 269 MiB free, took `EngineDeadError`, and 500'd 8 of 16 requests at a 31,702 MiB peak. The 5.75 GiB above was sized from a load test instead. It peaked at 30,706 MiB with no failures on v0.27.1 and peaks at 31,302 MiB on v0.30.0, where CUDA graphs cost more.
 - **`--max-num-batched-tokens 2048`, for memory rather than latency.** The GDN chunked scratch buffer scales at ~0.22 GiB per 1k tokens as profiled and ~0.38 GiB per 1k under load, straight out of the KV pool; 32768 does not boot at all (`Available KV cache memory: -2.96 GiB`). Nothing is lost by going small — prefill on this card is compute-bound at ~9.5k tok/s and chunk size is neutral from 2048 to 8192, while 16384 is 16–26% *worse* at 16k–30k prompts. Raising 2048 → 8192 would buy no prefill speed and cost ~47k KV tokens.
 
 One counterintuitive result: a *larger* `--max-model-len` yields **more** usable KV tokens from identical bytes, because it changes how the hybrid allocator pads attention and mamba pages to a common size — 32768 gives 120,149 tokens, 65536 gives 144,179, and the 131072 shipped here gives 153,382. It is isolated to that flag; `--max-num-seqs` 8 and 16 give the same count. The trade-off is at the top end: one request at the full 131k context consumes most of the pool (max concurrency 1.17x), so long-context and concurrent use are mutually exclusive here.
@@ -97,13 +105,22 @@ Measured on this config, greedy, MTP k=2 at 54.9% acceptance:
 | 8k prompts, output throughput | — | 365.6 tok/s |
 | TTFT, 1k / 8k prompt | 135 ms / 903 ms | median 2.91 s at 8k |
 
-Those were measured on v0.27.1. Re-run on v0.29.0 (2026-09-09, same bench, same-day v0.27.1 control of 100.1 / 664 tok/s), chat decode moved to **112.2 tok/s at c1 and 893 tok/s at c8**, acceptance 60.1%: the new default V2 model runner captures FULL decode CUDA graphs where v0.27.1 fell back to PIECEWISE with MTP on FlashInfer. The KV pool is unchanged at 153,382 tokens, but graph capture takes 0.33 GiB instead of 0.14 and idle usage is ~1.4 GiB higher, so the headroom under a 16-request burst of unique 13k-token prompts is now ~1.3 GiB (peak 31,274 MiB, no failures). The 8k-prompt and TTFT rows were not re-measured.
+Those were measured on v0.27.1. Re-run on v0.29.0 (2026-09-09, same bench, same-day v0.27.1 control of 100.1 / 664 tok/s), chat decode moved to **112.2 tok/s at c1 and 893 tok/s at c8**, acceptance 60.1%: the new default V2 model runner captures FULL decode CUDA graphs where v0.27.1 fell back to PIECEWISE with MTP on FlashInfer. The KV pool is unchanged at 153,382 tokens, but graph capture takes 0.33 GiB instead of 0.14 and idle usage is ~1.4 GiB higher, so the headroom under a 16-request burst of unique 13k-token prompts is now ~1.3 GiB (peak 31,274 MiB, no failures).
+
+On v0.30.0 (2026-09-23, against a same-day v0.29.0 control) the results match v0.29.0:
+
+- **Decode:** c1 is 112.1 tok/s against 112.2.
+- **c8 cell:** [bench.py](bench.py) read 824 against 892 tok/s, at 53.7% against 60.1% acceptance. That gap is noise. The cell sends eight identical greedy prompts, and they fork into different texts depending on batch timing, so the cell is one sample of whichever text comes out. On 24 distinct prompts at c8 the versions measured 811–831 and 805–821 tok/s, both at 55–56% acceptance.
+- **Memory:** the KV pool and the 0.33 GiB of graph memory are unchanged. The burst peaks at 31,302 MiB against 31,282 with no failures.
+- **TTFT:** at 1k / 8k / 32k-token prompts it is 123 / 868 / 4,509 ms, against 122 / 853 / 4,450.
+
+The 8k-prompt throughput row was not re-measured on either release.
 
 Image input works on this config as shipped (the checkpoint is a VL model), verified end-to-end against the served endpoint.
 
 ## Benchmarks
 
-All figures below were measured on vLLM v0.26.0 (the cluster on a v0.27 pre-release nightly) with this repo's config as-is, MTP speculative decoding enabled, on three Blackwell setups; the repo now pins v0.29.0, and the 27B was re-verified on it on every config — see the second table:
+All figures below were measured on vLLM v0.26.0 (the cluster on a v0.27 pre-release nightly) with this repo's config as-is, MTP speculative decoding enabled, on three Blackwell setups; the repo now pins v0.30.0, and the 27B was re-verified on it on every config — see the second table:
 
 | Machine | GPU | Memory | Config | `--gpu-memory-utilization` | `--max-num-batched-tokens` |
 | --- | --- | --- | --- | --- | --- |
@@ -126,15 +143,25 @@ Greedy chat completions generating 1024 tokens, decode rate timed from the first
 | 2x DGX Spark | [Qwen3.6-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-27B-NVFP4) | 28 tok/s | 169 tok/s | 70% | 4.48M tokens |
 | 2x DGX Spark | [Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-NVFP4) | 64 tok/s | 311 tok/s | 68% | 13.26M tokens |
 
-Re-verified on **v0.29.0** (2026-09-09), Qwen3.6-27B only, each against a v0.27.1 control run the same day on the same machine (the cluster against its 2026-08-12/19 v0.27.1 figures of 28 / 167–178). v0.29.0 makes the V2 model runner the default, which captures FULL decode CUDA graphs where v0.27.1 fell back to PIECEWISE with MTP on FlashInfer; the discrete cards and the cluster gain from it, the single Spark does not. Graph capture costs more memory everywhere (3.2 GiB vs 1.1 on a Spark), which is where the smaller KV pools come from:
+Re-verified on **v0.30.0** (2026-09-23), Qwen3.6-27B only. Each config was checked against a v0.29.0 control run the same day on the same machine:
 
-| Machine | v0.27.1 control, c1 / c8 | v0.29.0, c1 / c8 | MTP acceptance | KV cache capacity |
+| Machine | v0.29.0 control, c1 / c8 | v0.30.0, c1 / c8 | MTP acceptance | KV cache capacity |
 | --- | --- | --- | --- | --- |
-| RTX PRO 6000 | 116 / 824 tok/s | **123 / 940 tok/s** | 69% | 1.48M tokens |
-| DGX Spark | 23 / 145 tok/s | 23 / 151 tok/s | 70% | 1.91M tokens |
-| 2x DGX Spark | 28 / 167 tok/s | **37 / 228 tok/s** | 69% | 4.37M tokens |
+| RTX PRO 6000 | 123 / 937 tok/s | 122 / 967 tok/s | 70% | 1.49M tokens |
+| DGX Spark | 23 / 136 tok/s | 22 / 148 tok/s | 71% | 1.88M tokens |
+| 2x DGX Spark | 37 / 232 tok/s | 37 / 227 tok/s | 69% | 4.37M tokens |
 
-The Spark's host memory bottomed out at 19 GiB available during the single-node boot and 12 GiB on the cluster head, both more comfortable than v0.27.1 at the same 0.78 utilization. Tool calling and the reasoning parser were checked on every config.
+Decode is flat. The c8 column is one batch of eight identical prompts, which can fork into different texts from run to run, so it moves by several percent either way. The one decode change that repeats is the single Spark's c1, down 4% (22.0 against 22.9 tok/s) at unchanged acceptance and consistent across runs.
+
+v0.30.0 moves the gated-DeltaNet prefill onto a FlashInfer kernel, and prefill is where the release shows:
+
+- **Single Spark:** TTFT on a 1k / 8k / 32k-token prompt fell 8 / 11 / 9%, from 526 / 3,493 / 16,499 ms to 484 / 3,122 / 15,024.
+- **RTX PRO 6000:** 3.5% faster at 8k and 32k.
+- **Cluster:** 3% faster at 32k, but 1k rose from 407 to 501 ms, consistently across runs.
+
+The Sparks' host memory bottomed out slightly higher than on v0.29.0, at 19.0 GiB available during the single-node boot and 13.1 GiB on the cluster head. Tool calling, the reasoning parser and long-context retrieval were checked on every config.
+
+The previous bump, to v0.29.0 (2026-09-09, against same-day v0.27.1 controls), is the one that moved decode. It made the V2 model runner the default, which captures FULL decode CUDA graphs where v0.27.1 fell back to PIECEWISE with MTP on FlashInfer. That took the RTX PRO 6000 from 116 / 824 to 123 / 940 tok/s and the cluster from 28 / 167 to 37 / 228, and left the single Spark at 23 / 151. Graph capture also started costing more memory (3.2 GiB against 1.1 on a Spark), which is why the KV pools shrank by a few percent.
 
 Reproduce against a running server with [bench.py](bench.py) (no dependencies beyond the standard library):
 

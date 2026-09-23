@@ -62,13 +62,13 @@ Verified with [unsloth/Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/unsloth/Qwe
 
 The serve profile reuses the single-Spark tuning unchanged — fp8 KV cache, utilization 0.78 (a per-node fraction; the host-starvation ceiling it protects doesn't move by adding a machine), `--max-num-batched-tokens 2048` — and keeps MTP speculative decoding on.
 
-If the engine dies at startup with `RuntimeError: NCCL error: unhandled system error` out of the first pynccl all-reduce, the cause is on the hosts, not in vLLM. Rerunning with `NCCL_DEBUG=INFO` shows the RoCE NIC failing to register NCCL's buffers (`ibv_reg_mr_iova2 failed with error Cannot allocate memory`), even with gigabytes free and memlock unlimited. The trigger is the state of host memory after some uptime on the DGX OS 7.0 kernel, and it fails the same way on any vLLM version. It comes and goes: the same boot can fail twice and then succeed. Dropping the page cache and compacting memory on **both** Sparks clears it:
+If the engine dies at startup with `RuntimeError: NCCL error: unhandled system error` out of the first pynccl all-reduce, the cause is on the hosts, not in vLLM. Rerunning with `NCCL_DEBUG=INFO` shows the RoCE NIC failing to register NCCL's buffers (`ibv_reg_mr_iova2 failed with error Cannot allocate memory`), even with gigabytes free and memlock unlimited. The trigger is the state of host memory after some uptime on the DGX OS 7.0 kernel, and it fails the same way on any vLLM version. It comes and goes: the same boot can fail twice and then succeed. Dropping the page cache and compacting memory on **both** Sparks clears it, so `head` and `worker` now do that before starting the node:
 
 ```bash
 sync; echo 3 | sudo tee /proc/sys/vm/drop_caches; echo 1 | sudo tee /proc/sys/vm/compact_memory
 ```
 
-Then `stop` both nodes and bring up `head`, `worker` and `serve` again. Setting `NCCL_DMABUF_ENABLE=0` or `NCCL_CUMEM_HOST_ENABLE=0` does not help.
+That step needs sudo. Without it the node starts anyway with a warning, and you can run the line above by hand on both Sparks before `head` and `worker`. Set `CLUSTER_RECLAIM_MEMORY=0` to skip the step. Setting `NCCL_DMABUF_ENABLE=0` or `NCCL_CUMEM_HOST_ENABLE=0` does not help.
 
 One caveat if you pin your own image: multi-node needs **vLLM v0.27.0 or later**. v0.26.0's shared-memory message queue — which the engine uses to drive cross-node workers — can lose a reader wakeup notification, parking the engine and both workers forever on queues that have data; the engine then dies minutes later with "RPC call to sample_tokens timed out". v0.27.0 bounds the park time so a lost wakeup recovers within ~5 s. Single-node deployments don't exercise this path at risk.
 

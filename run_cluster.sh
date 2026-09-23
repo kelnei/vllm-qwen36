@@ -31,6 +31,7 @@
 #   CLUSTER_IF        200G interface name        (default enP2p1s0f1np1)
 #   CLUSTER_HCA       its RDMA device for RoCE   (default roceP2p1s0f1)
 #   VLLM_IMAGE        container image            (default: same tag as compose)
+#   CLUSTER_RECLAIM_MEMORY  drop caches + compact memory at node start (default 1)
 #
 # Multi-node needs v0.27.0 or later. v0.26.0's shm_broadcast message queue —
 # which the executor uses to drive cross-node workers — could lose a reader
@@ -67,7 +68,7 @@ SERVE_SESSION=vllm-serve
 SERVE_LOG="$HOME/vllm-cluster-serve.log"
 
 usage() {
-  sed -n '2,45p' "$SELF" | sed 's/^# \{0,1\}//'
+  sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//'
   exit 1
 }
 
@@ -90,6 +91,22 @@ require_node_ip() {
 # which blocks on the Ray container for the life of the cluster.
 # ---------------------------------------------------------------------------
 
+# NCCL registers its buffers with the RoCE NIC, and after some uptime on the
+# DGX OS 7.0 kernel that registration can fail with ENOMEM (ibv_reg_mr) even
+# with most of the memory free: the engine then dies in its first all-reduce
+# with "NCCL error: unhandled system error". Dropping the page cache and
+# compacting memory before the node starts clears it. Needs sudo; without it
+# the node still starts, with a warning.
+reclaim_host_memory() {
+  [ "${CLUSTER_RECLAIM_MEMORY:-1}" = 1 ] || return 0
+  echo "Dropping page cache and compacting memory so NCCL can register its RDMA buffers (sudo)"
+  if ! { sync &&
+    echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null &&
+    echo 1 | sudo tee /proc/sys/vm/compact_memory >/dev/null; }; then
+    echo "WARNING: couldn't drop caches; if the engine dies with 'NCCL error: unhandled system error', see the README's two-Spark section" >&2
+  fi
+}
+
 start_node() {
   local role="$1" head_ip="$2"
   require_node_ip
@@ -97,6 +114,7 @@ start_node() {
 
   tmux has-session -t "$NODE_SESSION" 2>/dev/null && die "tmux session '$NODE_SESSION' already exists — './run_cluster.sh stop' first"
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  reclaim_host_memory
 
   echo "Starting $role node: $NODE_IP on $CLUSTER_IF (head: $head_ip, image: $VLLM_IMAGE)"
   tmux new-session -d -s "$NODE_SESSION" \

@@ -11,12 +11,12 @@
 #
 # Usage — each command runs on the Spark it describes:
 #
-#   ./run_cluster.sh head                      # on the head node, first
-#   ./run_cluster.sh worker [head_ip]          # on each worker node, once the head is up
-#   ./run_cluster.sh serve [27b|35b-a3b] [tp]  # on the head node: start vLLM
-#                                              # (default 27b, tensor-parallel 2)
-#   ./run_cluster.sh status                    # any node: tmux/container/ray/API state
-#   ./run_cluster.sh stop                      # any node: tear down this node's half
+#   ./run_cluster.sh head                             # on the head node, first
+#   ./run_cluster.sh worker [head_ip]                 # on each worker node, once the head is up
+#   ./run_cluster.sh serve [27b|35b-a3b|38-27b] [tp]  # on the head node: start vLLM
+#                                                     # (default 27b, tensor-parallel 2)
+#   ./run_cluster.sh status                           # any node: tmux/container/ray/API state
+#   ./run_cluster.sh stop                             # any node: tear down this node's half
 #
 # Everything long-running lives in a detached tmux session, so an SSH drop
 # doesn't take the cluster down: `ray-node` holds the Ray container, and on the
@@ -182,8 +182,8 @@ active_ray_nodes() {
 cmd_serve() {
   local model="${1:-27b}" tp="${2:-2}"
   case "$model" in
-    27b|35b-a3b) ;;
-    *) die "unknown model '$model' (want: 27b or 35b-a3b)" ;;
+    27b|35b-a3b|38-27b) ;;
+    *) die "unknown model '$model' (want: 27b, 35b-a3b or 38-27b)" ;;
   esac
   case "$tp" in
     ''|*[!0-9]*) die "tensor-parallel size '$tp' isn't a number" ;;
@@ -208,6 +208,7 @@ _serve() {
   case "$model" in
     27b)     repo=unsloth/Qwen3.6-27B-NVFP4     served=qwen3.6-27b ;;
     35b-a3b) repo=unsloth/Qwen3.6-35B-A3B-NVFP4 served=qwen3.6-35b-a3b ;;
+    38-27b)  repo=kelnei/Qwen3.8-27B-NVFP4      served=qwen3.8-27b ;;
   esac
 
   # The engine flags mirror docker-compose.spark.yml — same model config, same

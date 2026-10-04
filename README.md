@@ -48,6 +48,8 @@ The compose file targets Qwen3.6-27B, but any Qwen3.6 NVFP4 checkpoint works the
 
 Verified with [unsloth/Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-NVFP4) (MoE, 3B active parameters): with only those two values changed, vLLM resolves the MoE architecture, loads the bundled MTP head, and picks the NVFP4 MoE fast path (`FLASHINFER_CUTLASS` backend). First boot reached healthy in ~7 minutes including the cold weight download, within the healthcheck's 10-minute allowance. See [Benchmarks](#benchmarks) for how it performs.
 
+[kelnei/Qwen3.8-27B-NVFP4](https://huggingface.co/kelnei/Qwen3.8-27B-NVFP4), the checkpoint the [32 GB config](#32-gb-cards-rtx-5090) ships, also swaps in the same way, with the same two values changed. It was verified on 2026-10-04 on the RTX PRO 6000, a single Spark and the cluster (`serve 38-27b`): it loads its MTP head, and chat, thinking, tool calls, image input and long-context retrieval all work. It is a different model, not a Qwen3.6 variant, and its MTP head accepts fewer drafts, so it decodes slower than the Qwen3.6-27B — see [Benchmarks](#chat-decode-throughput).
+
 ## Two-Spark cluster
 
 [run_cluster.sh](run_cluster.sh) joins two DGX Sparks into a Ray cluster and serves one model across both GPUs with tensor parallelism (TP=2), NCCL riding RDMA (RoCE) over the dedicated 200 GbE link between them. A single GB10 already runs these models comfortably; what the second Spark buys is headroom — twice the aggregate memory bandwidth and twice the KV-cache memory — at the price of putting every tensor-parallel all-reduce on the wire.
@@ -55,8 +57,10 @@ Verified with [unsloth/Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/unsloth/Qwe
 ```bash
 ./run_cluster.sh head                # on the head Spark
 ./run_cluster.sh worker              # on the other Spark (head IP from .env, or pass it)
-./run_cluster.sh serve 27b           # back on the head; or: serve 35b-a3b
+./run_cluster.sh serve 27b           # back on the head; or: serve 35b-a3b, serve 38-27b
 ```
+
+More Sparks join the same way: start `worker` on each, then give `serve` the tensor-parallel size as its second argument (`./run_cluster.sh serve 27b 4`). Four Sparks pay off on the dense models but not on the MoE; see [Chat decode throughput](#chat-decode-throughput).
 
 `status` reports tmux/container/Ray/API state on any node; `stop` tears down that node's half. Everything long-running lives in detached tmux sessions (`ray-node` holds the Ray container on each node, `vllm-serve` holds the engine on the head), so an SSH drop doesn't take the cluster down; engine output is mirrored to `~/vllm-cluster-serve.log`. Set `CLUSTER_HEAD_IP` in `.env` (see `.env.example`) to the head's IP *on the 200G link*; `CLUSTER_IF` and `CLUSTER_HCA` default to the Spark's 200G netdev and its RoCE device. The image ships without Ray, so each node pip-installs it at container start (~1 min, needs internet). Once healthy, the API is on port 8000 of the head node, same as the single-node compose.
 
@@ -74,7 +78,7 @@ One caveat if you pin your own image: multi-node needs **vLLM v0.27.0 or later**
 
 ## 32 GB cards (RTX 5090)
 
-[docker-compose.rtx5090.yml](docker-compose.rtx5090.yml) serves [kelnei/Qwen3.8-27B-NVFP4](https://huggingface.co/kelnei/Qwen3.8-27B-NVFP4) on a single RTX 5090. Select it with `COMPOSE_FILE=docker-compose.rtx5090.yml` in `.env`. It targets 1–8 concurrent requests, not wide serving, and it is a **different model** from the rest of this repo — the Qwen3.8 checkpoint, whose numbers are not comparable to the Qwen3.6 tables below.
+[docker-compose.rtx5090.yml](docker-compose.rtx5090.yml) serves [kelnei/Qwen3.8-27B-NVFP4](https://huggingface.co/kelnei/Qwen3.8-27B-NVFP4) on a single RTX 5090. Select it with `COMPOSE_FILE=docker-compose.rtx5090.yml` in `.env`. It targets 1–8 concurrent requests, not wide serving, and it is a **different model** from the rest of this repo — the Qwen3.8 checkpoint, whose numbers are not comparable to the Qwen3.6 rows below. The [chat decode table](#chat-decode-throughput) also runs it on the larger configs, for a like-for-like comparison.
 
 **This config assumes a headless machine with the card dedicated to the model.** That is a precondition, not a detail. The KV pool below is sized to within ~1.3 GiB of the card's total capacity, measured under load; a desktop session, a browser, or any other CUDA process sharing the GPU takes that headroom and the engine dies on the first concurrent burst rather than degrading gracefully. On a shared card none of these numbers hold and the pool has to be re-derived with the rest of the load subtracted from the budget.
 
@@ -120,63 +124,85 @@ Image input works on this config as shipped (the checkpoint is a VL model), veri
 
 ## Benchmarks
 
-All figures below were measured on vLLM v0.26.0 (the cluster on a v0.27 pre-release nightly) with this repo's config as-is, MTP speculative decoding enabled, on three Blackwell setups; the repo now pins v0.30.0, and the 27B was re-verified on it on every config — see the second table:
+All figures below were measured with this repo's config as-is, MTP speculative decoding enabled, on these Blackwell setups. The chat-decode table was re-measured on vLLM v0.30.0 (2026-10-04), every model on every config. The [standard serving benchmark](#standard-serving-benchmark) further down is the original v0.26.0 measurement, with the cluster on a v0.27 pre-release nightly:
 
 | Machine | GPU | Memory | Config | `--gpu-memory-utilization` | `--max-num-batched-tokens` |
 | --- | --- | --- | --- | --- | --- |
 | **RTX PRO 6000** | RTX PRO 6000 Blackwell Workstation (sm120) | 96 GB dedicated | [docker-compose.yml](docker-compose.yml) | 0.85 | 32768 |
 | **DGX Spark** | GB10 Grace Blackwell (sm121) | 121 GB unified | [docker-compose.spark.yml](docker-compose.spark.yml) | 0.78 | 2048 |
 | **2x DGX Spark** | 2x GB10, TP=2 over 200 GbE (RoCE) | 2x 121 GB unified | [run_cluster.sh](run_cluster.sh) | 0.78 per node | 2048 |
+| **4x DGX Spark** | 4x GB10, TP=4 over 200 GbE (RoCE) | 4x 121 GB unified | [run_cluster.sh](run_cluster.sh) | 0.78 per node | 2048 |
 
 All of them take the native NVFP4 path — `FlashInferCutlassNvFp4LinearKernel` for dense GEMMs, the `FLASHINFER_CUTLASS` backend for MoE — including the GB10s on stock upstream images, with no Marlin fallback.
 
 ### Chat decode throughput
 
-Greedy chat completions generating 1024 tokens, decode rate timed from the first streamed token to the last so prefill is excluded. Single-stream is the mean of 3 runs; the aggregate is one batch of 8 concurrent requests. This is what [bench.py](bench.py) measures:
+Greedy chat completions generating 1024 tokens, decode rate timed from the first streamed token to the last so prefill is excluded. Single-stream is the mean of 3 runs; the aggregate is one batch of 8 concurrent requests. This is what [bench.py](bench.py) measures. Every config was measured on **v0.30.0** on 2026-10-04. All but the four-Spark rows were paired with a v0.29.0 control run the same day on the same machine:
 
-| Machine | Model | Single-stream decode | 8 concurrent, aggregate | MTP acceptance | KV cache capacity |
-| --- | --- | --- | --- | --- | --- |
-| RTX PRO 6000 | [Qwen3.6-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-27B-NVFP4) | 113 tok/s | 775 tok/s | 67% | 1.51M tokens |
-| RTX PRO 6000 | [Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-NVFP4) | 281 tok/s | 1,546 tok/s | 69% | 4.34M tokens |
-| DGX Spark | [Qwen3.6-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-27B-NVFP4) | 22 tok/s | 139 tok/s | 70% | 2.00M tokens |
-| DGX Spark | [Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-NVFP4) | 76 tok/s | 316 tok/s | 67% | 5.70M tokens |
-| 2x DGX Spark | [Qwen3.6-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-27B-NVFP4) | 28 tok/s | 169 tok/s | 70% | 4.48M tokens |
-| 2x DGX Spark | [Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-NVFP4) | 64 tok/s | 311 tok/s | 68% | 13.26M tokens |
+| Machine | Model | Single-stream decode | 8 concurrent, aggregate | MTP acceptance | KV cache capacity | v0.29.0 control, c1 / c8 |
+| --- | --- | --- | --- | --- | --- | --- |
+| RTX PRO 6000 | [Qwen3.6-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-27B-NVFP4) | 119.7 tok/s | 949 tok/s | 70% | 1.49M tokens | 124.8 / 906 tok/s |
+| RTX PRO 6000 | [Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-NVFP4) | 348.4 tok/s | 1,846 tok/s | 68% | 4.24M tokens | 342.3 / 1,814 tok/s |
+| RTX PRO 6000 | [Qwen3.8-27B-NVFP4](https://huggingface.co/kelnei/Qwen3.8-27B-NVFP4) ‡ | 104.0 tok/s | 794 tok/s | 52% | 1.49M tokens | 108.0 / 826 tok/s |
+| DGX Spark | [Qwen3.6-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-27B-NVFP4) | 21.6 tok/s | 145 tok/s | 71% | 1.88M tokens | 21.4 / 143 tok/s |
+| DGX Spark | [Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-NVFP4) | 90.3 tok/s | 336 tok/s | 68% | 5.40M tokens | 90.1 / 332 tok/s |
+| DGX Spark | [Qwen3.8-27B-NVFP4](https://huggingface.co/kelnei/Qwen3.8-27B-NVFP4) ‡ | 18.7 tok/s | 118 tok/s | 53% | 1.87M tokens | 19.0 / 121 tok/s |
+| 2x DGX Spark | [Qwen3.6-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-27B-NVFP4) | 35.3 tok/s | 218 tok/s | 69% | 4.35M tokens | 35.3 / 220 tok/s |
+| 2x DGX Spark | [Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-NVFP4) | 108.9 tok/s | 469 tok/s | 68% | 13.02M tokens | 110.4 / 469 tok/s |
+| 2x DGX Spark | [Qwen3.8-27B-NVFP4](https://huggingface.co/kelnei/Qwen3.8-27B-NVFP4) ‡ | 30.0 tok/s | 191 tok/s | 54% | 4.35M tokens | 30.8 / 189 tok/s |
+| 4x DGX Spark | [Qwen3.6-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-27B-NVFP4) | 48.3 tok/s | 265 tok/s | 70% | 9.38M tokens | — |
+| 4x DGX Spark | [Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-NVFP4) | 109.4 tok/s | 508 tok/s | 68% | 14.84M tokens | — |
+| 4x DGX Spark | [Qwen3.8-27B-NVFP4](https://huggingface.co/kelnei/Qwen3.8-27B-NVFP4) ‡ | 42.4 tok/s | 228 tok/s | 54% | 9.37M tokens | — |
 
-Re-verified on **v0.30.0** (2026-09-23), Qwen3.6-27B only. Each config was checked against a v0.29.0 control run the same day on the same machine:
+‡ A different model, not a Qwen3.6 variant: the checkpoint the [32 GB config](#32-gb-cards-rtx-5090) ships, run here with the Qwen3.6-27B's config unchanged. It is the same size, with the same KV footprint, and decodes 12–15% slower than the Qwen3.6-27B on every config because its MTP head accepts fewer drafts (52–54% on this prompt, against ~70%).
 
-| Machine | v0.29.0 control, c1 / c8 | v0.30.0, c1 / c8 | MTP acceptance | KV cache capacity |
-| --- | --- | --- | --- | --- |
-| RTX PRO 6000 | 123 / 937 tok/s | 122 / 967 tok/s | 70% | 1.49M tokens |
-| DGX Spark | 23 / 136 tok/s | 22 / 148 tok/s | 71% | 1.88M tokens |
-| 2x DGX Spark | 37 / 232 tok/s | 37 / 227 tok/s | 69% | 4.37M tokens |
+**Decode is flat between the two releases on every config.** No cell moves by more than run-to-run spread. Two cells look like small regressions and are not; in both, the fixed prompt's greedy text differs between the releases:
 
-Decode is flat. The c8 column is one batch of eight identical prompts, which can fork into different texts from run to run, so it moves by several percent either way. The one decode change that repeats is the single Spark's c1, down 4% (22.0 against 22.9 tok/s) at unchanged acceptance and consistent across runs.
+- **Qwen3.6-27B on the RTX PRO 6000** reads 119.7 against 124.8. The two releases settle on different texts (70% against 67.5% acceptance). Over 8 distinct prompts at an identical 71.3% acceptance they measure 124.3 against 123.7 and 126.2 tok/s, on two v0.29.0 boots.
+- **Qwen3.8-27B on the RTX PRO 6000** reads 104.0 against 108.0. v0.29.0 itself lands on one of two texts from boot to boot, at 104.2 or 109.9. Over 8 distinct prompts the releases measure 111.8 against 111.1 and 113.9. On the Spark the same check gives 19.5 against 19.3.
 
-v0.30.0 moves the gated-DeltaNet prefill onto a FlashInfer kernel, and prefill is where the release shows:
+The 2026-09-23 re-verification of the 27B found the single Spark's c1 down 4% on v0.30.0 (22.0 against 22.9 tok/s). Today's controls put it at 21.6 against 21.4, so that did not reproduce. The two-Spark cluster's 27B measured 35 tok/s on both releases today, against 37 on both on 2026-09-23. That is a day-to-day difference, not a release one.
+
+v0.30.0 moves the gated-DeltaNet prefill onto a FlashInfer kernel, and prefill is where the release shows. Measured on the 27B on 2026-09-23:
 
 - **Single Spark:** TTFT on a 1k / 8k / 32k-token prompt fell 8 / 11 / 9%, from 526 / 3,493 / 16,499 ms to 484 / 3,122 / 15,024.
 - **RTX PRO 6000:** 3.5% faster at 8k and 32k.
 - **Cluster:** 3% faster at 32k, but 1k rose from 407 to 501 ms, consistently across runs.
 
-The Sparks' host memory bottomed out slightly higher than on v0.29.0, at 19.0 GiB available during the single-node boot and 13.1 GiB on the cluster head. Tool calling, the reasoning parser and long-context retrieval were checked on every config.
+The Sparks' host memory is no tighter on v0.30.0. During boot, available memory bottomed out at 19.7 GiB on a single Spark (17.9 on v0.29.0) and at 10.5 GiB on the two-Spark cluster's head (10.0 on v0.29.0); the cluster figure is set by the 35B-A3B, while the dense models leave 12–14 GiB. Chat, thinking, tool calling, long-context retrieval, a 20-question accuracy set and, on Qwen3.8, image input were checked on every model and config.
 
-The previous bump, to v0.29.0 (2026-09-09, against same-day v0.27.1 controls), is the one that moved decode. It made the V2 model runner the default, which captures FULL decode CUDA graphs where v0.27.1 fell back to PIECEWISE with MTP on FlashInfer. That took the RTX PRO 6000 from 116 / 824 to 123 / 940 tok/s and the cluster from 28 / 167 to 37 / 228, and left the single Spark at 23 / 151. Graph capture also started costing more memory (3.2 GiB against 1.1 on a Spark), which is why the KV pools shrank by a few percent.
+The previous bump, to v0.29.0 (2026-09-09, against same-day v0.27.1 controls), is the one that moved decode. It made the V2 model runner the default, which captures FULL decode CUDA graphs where v0.27.1 fell back to PIECEWISE with MTP on FlashInfer. That took the RTX PRO 6000's 27B from 116 / 824 to 123 / 940 tok/s and the cluster's from 28 / 167 to 37 / 228, and left the single Spark at 23 / 151. Graph capture also started costing more memory (3.2 GiB against 1.1 on a Spark), which is why the KV pools shrank by a few percent.
+
+The first measurements, on v0.26.0 (the cluster on a v0.27 pre-release nightly), for comparison. The serving benchmark below dates from then:
+
+| Machine | Model | Single-stream decode | 8 concurrent, aggregate | MTP acceptance | KV cache capacity |
+| --- | --- | --- | --- | --- | --- |
+| RTX PRO 6000 | Qwen3.6-27B | 113 tok/s | 775 tok/s | 67% | 1.51M tokens |
+| RTX PRO 6000 | Qwen3.6-35B-A3B | 281 tok/s | 1,546 tok/s | 69% | 4.34M tokens |
+| DGX Spark | Qwen3.6-27B | 22 tok/s | 139 tok/s | 70% | 2.00M tokens |
+| DGX Spark | Qwen3.6-35B-A3B | 76 tok/s | 316 tok/s | 67% | 5.70M tokens |
+| 2x DGX Spark | Qwen3.6-27B | 28 tok/s | 169 tok/s | 70% | 4.48M tokens |
+| 2x DGX Spark | Qwen3.6-35B-A3B | 64 tok/s | 311 tok/s | 68% | 13.26M tokens |
+
+The MoE gained the most since then: single-stream is up 24% on the RTX PRO 6000 (281 → 348), 19% on the Spark (76 → 90) and 70% on two Sparks (64 → 109). The 27B is up 6% on the RTX PRO 6000 and 26% on two Sparks, and flat on one.
 
 Reproduce against a running server with [bench.py](bench.py) (no dependencies beyond the standard library):
 
 ```bash
 ./bench.py                          # defaults to qwen3.6-27b
 ./bench.py --model qwen3.6-35b-a3b
+./bench.py --model qwen3.8-27b
 ```
 
-The MoE's 3B active parameters make it 2.5x faster per stream than the 27B dense model on the RTX PRO 6000, and 3.5x faster on the Spark, while its smaller KV footprint nearly triples cache capacity at the same 262k context. The Spark is 3.7–5.3x slower per stream than the RTX PRO 6000 — LPDDR5X bandwidth (~273 GB/s vs ~1.8 TB/s) is the decode limiter — but holds a *larger* KV cache despite the lower utilization fraction, since the GB10 has more total memory. Speculative-decode acceptance is prompt-dependent; expect a few points of variance either way.
+The MoE's 3B active parameters make it 2.9x faster per stream than the 27B dense model on the RTX PRO 6000, and 4.2x faster on the Spark, while its smaller KV footprint nearly triples cache capacity at the same 262k context. The Spark is 3.9–5.5x slower per stream than the RTX PRO 6000 — LPDDR5X bandwidth (~273 GB/s vs ~1.8 TB/s) is the decode limiter — but holds a *larger* KV cache despite the lower utilization fraction, since the GB10 has more total memory. Speculative-decode acceptance is prompt-dependent; expect a few points of variance either way.
 
-The cluster rows show what cross-node tensor parallelism does and doesn't buy. The bandwidth-bound dense 27B gains from splitting each layer across two memory systems: +27% single-stream, +21% at 8 concurrent. The MoE *loses* single-stream speed (64 vs 76 tok/s): with only 3B active parameters there is little decode work to split, so the per-layer all-reduce crossing the 200 GbE link (~25 GB/s vs ~273 GB/s local) dominates. What the cluster buys both models unambiguously is KV capacity — 2.2–2.3x, to 13.26M tokens on the MoE.
+The two-Spark rows show what cross-node tensor parallelism buys. The bandwidth-bound dense 27B gains the most from splitting each layer across two memory systems: +63% single-stream and +50% at 8 concurrent over one Spark. The MoE gains less, +21% single-stream and +40% at 8 concurrent. With only 3B active parameters there is less decode work to split, so the per-layer all-reduce crossing the 200 GbE link (~25 GB/s vs ~273 GB/s local) is a larger share of each step. On v0.26.0 that cost outweighed the gain and the MoE was *slower* single-stream on the cluster than on one Spark (64 vs 76 tok/s). It no longer is; which release turned that around was not isolated. The cluster also buys KV capacity: 2.3–2.4x, to 13.02M tokens on the MoE.
+
+Four Sparks (TP=4) split the dense models further. The 27B gains another 37% single-stream and 22% at 8 concurrent over two Sparks, reaching 48.3 tok/s, 2.2x one Spark; Qwen3.8 gains 41% and 19%. The MoE has nothing left to gain single-stream (109.4 against 108.9 tok/s) and adds 8% at 8 concurrent. KV capacity divides the same way. The 27B's four KV heads split one per rank, so its pool grows 2.2x over two Sparks, to 9.38M tokens. The MoE has only two, which TP=4 must replicate, so its pool grows just 1.14x, to 14.84M. These rows have no v0.29.0 control. Available host memory on the head bottomed out at 10.9 GiB on the MoE and 13.1–13.3 GiB on the dense models.
 
 ### Standard serving benchmark
 
-The table above uses one fixed prompt. For load-shaped numbers, `vllm bench serve` against the same servers: the `random` dataset over `/v1/completions`, `--ignore-eos` so every request emits exactly 1024 output tokens, and `--request-rate inf` so all requests are queued at once and the server is never idle. The client runs inside the serving container, so no network sits between it and the server:
+These are the original v0.26.0 measurements (the cluster on a v0.27 pre-release nightly) and were not re-run for v0.30.0, so compare them with the v0.26.0 chat-decode table above, not the current one. The chat-decode tables use one fixed prompt. For load-shaped numbers, `vllm bench serve` against the same servers: the `random` dataset over `/v1/completions`, `--ignore-eos` so every request emits exactly 1024 output tokens, and `--request-rate inf` so all requests are queued at once and the server is never idle. The client runs inside the serving container, so no network sits between it and the server:
 
 ```bash
 docker compose exec vllm vllm bench serve \
@@ -247,7 +273,7 @@ Reading these:
 - **The MoE is the right choice for the Spark.** At 8k it delivers ~2x the throughput of the 27B dense model and reaches the first token ~2.5x sooner at every concurrency, because 3B active parameters prefill about 2.7x faster on a bandwidth-limited part (6.0k vs 2.3k tok/s).
 - **Prefill chunk size is the largest configuration effect measured on either machine.** Cutting `--max-num-batched-tokens` from 32768 to 2048 raised the Spark's 8k throughput by 27–63% and more than halved its TTFT, at no cost in memory — see [Tuning](#tuning). The same change is not worth making on the RTX PRO 6000.
 - **MTP acceptance holds up under load**: 62–80% across the matrix, with no systematic decay as concurrency rises, even though the `random` dataset feeds the model incoherent prompts.
-- **Cluster scaling is model-dependent, and batching pays back what single-stream gives up.** The dense 27B gains everywhere: +33% at 1k/c64 (420 vs 316 tok/s) and +22% at 8k/c64 over one Spark. The MoE loses ~22% at c1 — the all-reduce latency cost discussed under [chat decode](#chat-decode-throughput) — but the wire cost amortizes across a batch: +14–20% at c8 and still ahead at c32/c64. TTFT also drops nearly across the board (an 8k prompt prefills ~1.3x faster on both models); the MoE's 1k c32/c64 cells are the one exception, where the queue drains fast enough that the all-reduce cost shows up in TTFT instead.
+- **Cluster scaling is model-dependent, and batching pays back what single-stream gives up.** The dense 27B gains everywhere: +33% at 1k/c64 (420 vs 316 tok/s) and +22% at 8k/c64 over one Spark. The MoE lost ~22% at c1 here, from the all-reduce latency cost discussed under [chat decode](#chat-decode-throughput), but the wire cost amortizes across a batch: +14–20% at c8 and still ahead at c32/c64. That c1 loss is gone on v0.30.0, where the MoE's chat decode is 21% faster single-stream on two Sparks than on one. TTFT also drops nearly across the board (an 8k prompt prefills ~1.3x faster on both models); the MoE's 1k c32/c64 cells are the one exception, where the queue drains fast enough that the all-reduce cost shows up in TTFT instead.
 
 All three configurations ran the identical matrix, each against its config as shipped. Every run in these tables completed all requests with zero failures.
 
